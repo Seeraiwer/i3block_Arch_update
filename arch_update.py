@@ -1,91 +1,139 @@
-#!/usr/bin/env python3
-# Inspiré par https://github.com/snowiow/i3blocks-contrib/blob/master/arch-update/arch-update.py
-# Script unifié pour i3blocks : détecte les mises à jour officielles et AUR,
-# avec fallback rapide si l'environnement Python n'est pas optimal.
-import os
-import re
-import subprocess
-import sys
-from typing import List, Set
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
-def parse_env_flag(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.lower() in {"1", "true", "yes", "y"}
+SCRIPT_NAME="$(basename "$0")"
 
-def get_env(key: str, default: str = "") -> str:
-    return os.getenv(key, default)
+# ——————————————————————————————
+# Compte les mises à jour pacman (officielles) et AUR
+has_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-def run_command(cmd: List[str], ignore_codes: Set[int]) -> List[str]:
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, check=True
-        )
-        return [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
-    except subprocess.CalledProcessError as e:
-        if e.returncode in ignore_codes:
-            return []
-        print(f"Erreur lors de l'exécution de {' '.join(cmd)}: {e}", file=sys.stderr)
-        return []
-    except FileNotFoundError:
-        return []
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if has_cmd timeout; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
 
-def get_pacman_updates() -> List[str]:
-    return run_command(["checkupdates"], ignore_codes={2})
+count_updates() {
+    local official=0 aur=0 total=0
+    local timeout_s="${TIMEOUT:-30}"
 
-def get_aur_updates() -> List[str]:
-    return run_command(["yay", "-Qum"], ignore_codes={1})
+    if has_cmd checkupdates; then
+        official=$( (LC_ALL=C run_with_timeout "$timeout_s" checkupdates 2>/dev/null | wc -l) || true )
+        official=${official//[^0-9]/}
+        official=${official:-0}
+    fi
 
-def filter_updates(updates: List[str], patterns: List[str]) -> Set[str]:
-    return {u for u in updates if any(re.match(p, u) for p in patterns)}
+    if has_cmd yay; then
+        aur=$( (LC_ALL=C run_with_timeout "$timeout_s" yay -Qum 2>/dev/null | wc -l) || true )
+        aur=${aur//[^0-9]/}
+        aur=${aur:-0}
+    fi
 
-def print_simple_output(count: int):
-    icon = get_env("LABEL", "")  # icône par défaut :  = wrench
-    print(f"{icon} {count}")
-    print(f"{icon} {count}")
-    print("#fb4934")  # rouge doux
+    total=$(( ${official:-0} + ${aur:-0} ))
+    echo "$total"
+}
 
-def print_pango_output(count: int, updates: List[str], patterns: List[str]):
-    base_color = get_env("BASE_COLOR", "green")
-    update_color = get_env("UPDATE_COLOR", "yellow")
-    label = get_env("LABEL", "")
-    quiet = parse_env_flag("QUIET", False)
+# ——————————————————————————————
+# Affichage pour i3blocks / polybar
+status() {
+    local total color
+    local label="${LABEL:-}"
+    local quiet="${QUIET:-0}"
+    total=$(count_updates)
 
-    if count > 0:
-        matched = filter_updates(updates, patterns) if patterns else set()
-        plural = 's' if count > 1 else ''
-        msg = f"{count} mise{plural} à jour disponible"
-        if matched:
-            msg += f" [{', '.join(sorted(matched))}]"
-        print(f"{label}<span color='{update_color}'>{msg}</span>")
-        print(f"{label}<span color='{update_color}'>{count}{'*' if matched else ''}</span>")
-    elif not quiet:
-        print(f"{label}<span color='{base_color}'>Système à jour</span>")
+    if [ "$total" -eq 0 ]; then
+        if [ "$quiet" = "1" ]; then
+            echo "OK"
+            return
+        fi
+        color="#00AF00"
+    else
+        color="#fb4934"
+    fi
 
+    # Trois lignes : full_text, short_text, color (même si 0)
+    echo "$label  $total"
+    echo "$label  $total"
+    echo "$color"
+}
 
-def main():
-    try:
-        use_pango = get_env("MARKUP", "pango") == "pango"
-        patterns = get_env("WATCH", "").split()
-        include_aur = parse_env_flag("AUR", False)
+# ——————————————————————————————
+# Routine complète de mise à jour (appelée par option « update »)
+perform_updates() {
+    local noconfirm_flag=""
+    if [ "${NOCONFIRM:-0}" = "1" ]; then
+        noconfirm_flag="--noconfirm"
+    fi
 
-        pacman = get_pacman_updates()
-        aur = get_aur_updates() if include_aur else []
-        updates = pacman + aur
-        count = len(updates)
+    echo "🛰  Mise à jour des miroirs…"
+    if has_cmd eos-rankmirrors; then
+        eos-rankmirrors || echo "⏩ Échec des miroirs, on continue…"
+    else
+        echo "⏩ eos-rankmirrors absent, on continue…"
+    fi
 
-        if use_pango:
-            print_pango_output(count, updates, patterns)
-        else:
-            if count > 0:
-                print_simple_output(count)
-            elif not parse_env_flag("QUIET", False):
-                print("OK")
-    except Exception as e:
-        print(f"Erreur: {e}", file=sys.stderr)
-        print("X")
+    echo "🔄 Mise à jour des paquets AUR & officiels…"
+    if has_cmd yay; then
+        sudo yay -Syyu $noconfirm_flag || echo "⏩ Échec yay, on continue…"
+    else
+        echo "⏩ yay absent, on continue…"
+    fi
 
-if __name__ == "__main__":
-    main()
+    echo "📦 Mise à jour pamac…"
+    if has_cmd pamac; then
+        sudo pamac upgrade -y || echo "⏩ Échec pamac, on continue…"
+    else
+        echo "⏩ pamac absent, on continue…"
+    fi
+
+    echo "🐍 Mise à jour pip…"
+    if has_cmd python3; then
+        sudo python3 -m pip install --upgrade pip --break-system-packages \
+            || echo "⏩ Échec pip, on continue…"
+    else
+        echo "⏩ python3 absent, on continue…"
+    fi
+}
+
+# ——————————————————————————————
+usage() {
+    cat <<EOF
+Usage : $SCRIPT_NAME [status|update]
+
+  status            Affiche le nombre de MAJ (pour i3blocks/polybar)
+  update            Lance eos-rankmirrors, yay, pamac et pip
+  -h, --help        Affiche cette aide
+
+Variables d'environnement :
+  LABEL=          Icône affichée (défaut : clé)
+  QUIET=1          Si 0 MAJ, affiche seulement "OK"
+  TIMEOUT=30       Timeout (secondes) pour checkupdates/yay -Qum
+  NOCONFIRM=1      Ajoute --noconfirm à yay
+EOF
+    exit 1
+}
+
+# ——————————————————————————————
+# Point d’entrée
+case "${1:-status}" in
+    status)
+        status
+        ;;
+    update)
+        perform_updates
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        echo "❌ Option inconnue : '$1'"
+        usage
+        ;;
+esac
