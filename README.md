@@ -55,3 +55,9 @@ update update   # lance eos-rankmirrors, yay, pamac et pip
 
 - Si `yay` est absent, le script ignore simplement l'AUR.
 - Si une commande est absente, le script continue en affichant un message clair.
+
+---
+
+## Licence
+
+GNU AGPL v3.
